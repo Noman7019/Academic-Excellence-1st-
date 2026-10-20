@@ -1,0 +1,114 @@
+name: Deploy to Hostinger
+# Manual only. backup = encrypted backup only; deploy = backup then deploy ./site/; restore = upload decrypted backup from restore_run_id.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "backup | deploy | restore"
+        type: choice
+        options: [backup, deploy, restore]
+        default: backup
+      restore_run_id:
+        description: "Run id whose live-backup artifact to restore (mode=restore only)"
+        required: false
+concurrency: { group: hostinger-deploy, cancel-in-progress: false }
+jobs:
+  backup:
+    if: inputs.mode != 'restore'
+    runs-on: ubuntu-latest
+    env:
+      FTP_HOST: ${{ secrets.FTP_HOST }}
+      FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+      FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+      FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR || '/public_html/' }}
+    steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq lftp gnupg
+      - name: Mirror remote dir (incl. dotfiles), counts only in log
+        run: |
+          set -o pipefail
+          mkdir -p backup/public_html
+          cat > lftprc <<'RC'
+          set ftp:ssl-allow yes
+          set ftp:ssl-force yes
+          set ftp:ssl-protect-data yes
+          set ssl:verify-certificate no
+          set ftp:list-options -a
+          set net:max-retries 2
+          set net:timeout 30
+          RC
+          o() { lftp -c "source lftprc; open -u \"$FTP_USERNAME\",\"$FTP_PASSWORD\" -p 21 $FTP_HOST; $1"; }
+          o "cls -la /" > backup/root-listing.txt 2> err.txt || { echo "::error::FTP login/list failed:"; sed "s/$FTP_PASSWORD/***/g" err.txt; exit 1; }
+          echo "Login OK. Root entries: $(wc -l < backup/root-listing.txt)"
+          SRC="$FTP_REMOTE_DIR"
+          o "cls -d $SRC" >/dev/null 2>&1 || { echo "$SRC not found, FTP root is the web root; mirroring /"; SRC=/; }
+          echo "$SRC" > backup/source-dir.txt
+          o "mirror --parallel=4 --no-perms $SRC backup/public_html/" > /dev/null 2> err.txt || { sed "s/$FTP_PASSWORD/***/g" err.txt; exit 1; }
+          n=$(find backup/public_html -type f | wc -l); echo "files: $n"; du -sh backup/public_html
+          test -f backup/public_html/index.html && echo "index.html present" || echo "index.html MISSING"
+          test -f backup/public_html/.htaccess && echo ".htaccess present" || echo ".htaccess MISSING"
+          test "$n" -gt 5 || { echo "::error::Backup looks empty ($n files)"; exit 1; }
+      - name: Encrypt (gpg AES256, passphrase = FTP_PASSWORD)
+        run: |
+          tar -czf backup.tar.gz backup
+          sha256sum backup.tar.gz | cut -d' ' -f1 > backup.tar.gz.sha256
+          printf '%s' "$FTP_PASSWORD" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --symmetric --cipher-algo AES256 -o backup.tar.gz.gpg backup.tar.gz
+          mkdir enc && mv backup.tar.gz.gpg backup.tar.gz.sha256 enc/ && rm -rf backup backup.tar.gz
+          ls -la enc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: live-backup-${{ github.run_id }}
+          path: enc/
+          retention-days: 90
+          if-no-files-found: error
+
+  restore:
+    if: inputs.mode == 'restore'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: live-backup-${{ inputs.restore_run_id }}
+          path: enc/
+          run-id: ${{ inputs.restore_run_id }}
+          github-token: ${{ github.token }}
+      - env: { FTP_PASSWORD: "${{ secrets.FTP_PASSWORD }}" }
+        run: |
+          printf '%s' "$FTP_PASSWORD" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 -d -o backup.tar.gz enc/backup.tar.gz.gpg
+          tar -xzf backup.tar.gz
+      - uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_HOST }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          port: 21
+          local-dir: ./backup/public_html/
+          server-dir: ${{ secrets.FTP_REMOTE_DIR || '/public_html/' }}
+          state-name: .ftp-restore-sync-state.json
+          dangerous-clean-slate: false
+
+  deploy:
+    if: inputs.mode == 'deploy'
+    needs: backup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: test -f site/index.html && test -f site/.htaccess
+      - uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_HOST }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          port: 21
+          local-dir: ./site/
+          server-dir: ${{ secrets.FTP_REMOTE_DIR || '/public_html/' }}
+          dangerous-clean-slate: false
+          exclude: |
+            **/.git*
+            **/.git*/**
+            .github/**
+            **/README*
+            **/node_modules/**
+            **/*.log
+            **/.DS_Store
