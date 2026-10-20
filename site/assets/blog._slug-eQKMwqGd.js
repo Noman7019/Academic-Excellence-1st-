@@ -1,0 +1,1 @@
+import{t as e}from"./jsx-runtime-bzQ4Vb5N.js";import{n as t,t as n}from"./Footer-6fdhrII4.js";var r=e(),i=()=>(0,r.jsxs)(`div`,{className:`min-h-screen`,children:[(0,r.jsx)(t,{}),(0,r.jsx)(`div`,{className:`container-page py-20 text-center`,children:`Something went wrong.`}),(0,r.jsx)(n,{})]});export{i as errorComponent};
